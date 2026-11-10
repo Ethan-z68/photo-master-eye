@@ -21,7 +21,7 @@ description: >
   (that module was removed; if the user asks for 调色, say so and suggest darktable /
   Lightroom / a dedicated tool).
 metadata:
-  version: "1.6.2"
+  version: "1.6.3"
   license: "MIT"
   requires: "Python 3.9+, Pillow 10+, numpy (survey/level/panels); macOS `sips` only for RAW"
   network: "none - fully local, no API keys"

@@ -54,6 +54,17 @@ from xml.sax.saxutils import escape as xml_escape
 
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
+# Windows consoles default to a legacy code page (cp936 / cp1252) while every
+# message here is UTF-8 and routinely contains a Chinese filename or path.
+# Without this, printing the result raised UnicodeEncodeError AFTER the image
+# had already been written -- the work succeeded and the run still looked like
+# a crash. reconfigure() is 3.7+; if it is unavailable we just keep going.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):  # pragma: no cover
+        pass
+
 try:
     from PIL import __version__ as PILLOW_VERSION
 except ImportError:  # pragma: no cover
