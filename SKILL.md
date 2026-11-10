@@ -21,7 +21,7 @@ description: >
   (that module was removed; if the user asks for 调色, say so and suggest darktable /
   Lightroom / a dedicated tool).
 metadata:
-  version: "1.6.3"
+  version: "1.6.4"
   license: "MIT"
   requires: "Python 3.9+, Pillow 10+, numpy (survey/level/panels); macOS `sips` only for RAW"
   network: "none - fully local, no API keys"
@@ -53,6 +53,18 @@ v1.2.0 起本 skill 是**纯构图工具**：
 > 取景流程改为「先数字、后眼睛」。原因很直接：一次任务 96.9% 的时间不在
 > 像素运算上，而在往返次数和每次重读上下文的成本上，而其中近半数工具调用
 > 是临时手写的测量脚本。详见「性能」节。
+
+> **v1.6.4（2026-11-10，缺陷清单修复）**：四条会造成**错误交付**的问题已修：
+> ① `--rotate` 对互质比例（800×533、1000×999）曾原尺寸输出并谎报
+> `kept_fraction: 1.0`，四个黑楔留在成品里；
+> ② 越界 `--crop` 曾静默改比例（1080×720 上 `900,0,600,400` 变成 180×400）；
+> ③ `candidates --ratios 1:1` 的 `crop_source` 曾被吸到**原图**比例，拿去
+> `finish --crop` 出来的是 3:2 —— 交付的不是你看的那一版；
+> ④ RGBA 源存 JPEG 直接崩（`cannot write mode RGBA as JPEG`）。
+> 另外 `--crop` 现在接受负坐标（不必再写 `--crop=`），非法 `--ratio` 给可读报错，
+> `panels --regions` 与 `--crops-src` 语法统一。
+> **`finish` 新增 `no_crop` / `warnings` / `crop_adjustment` 三个字段，出片后先看
+> `warnings`。**
 
 > 别把 Shore 做成「风格开关」。他反对把 stylization 强加给作品。
 > 本 skill 只负责问对问题、讲清取舍，**不宣称自动产出大师构图**。
@@ -104,6 +116,19 @@ Pillow/numpy 代码**——v1.5.2 之前 47.5% 的工具调用是临时测量脚
    `edge_penalty`，以及可直接粘贴的 `finish --crop`）。
    **方案表故意不打总分、不排序**——按「你愿意牺牲什么」自己选，
    见 `references/composition-rules.md` 第三节。
+
+   > **`scenarios` 常常是空的，这不是失败**（v1.6.4 实测）。采样器只在
+   > **内容框之外的空白边距**里找切点：一张内容占满整帧的街景（IMG_0864）
+   > 一个方案都给不出，而那张图实际要裁掉 20%。所以**先读 `verdict`**，
+   > 三种情况处理不同：
+   > - `no structure at all` → 纯色/合成图，不裁；照实说取景没变。
+   > - `content fills the frame edge to edge` → **采样器的局限，不是照片的结论**。
+   >   改用 `structure_lines` + `clean_cuts`（低边缘能量位置）+ `budget`
+   >   手工选切点，再写进 `candidates --crops-src`。
+   > - `no framing option survived the sampler` → 同样只是采样器没找到，
+   >   **不等于「已经够紧」**。要裁就得明说牺牲了哪些内容、为什么值得。
+   >
+   > 一句话：`scenarios` 是加速器，不是判据；`verdict` 才是要读的那一行。
 1. **找结构线**：先找画面里客观存在的水平/垂直参考——楼层石带、檐口、柱、
    路面边线、地平线。裁切边**必须落在这些线上**，不要横穿窗户、
    不要把行人/招牌/转角切成两半。
@@ -485,6 +510,17 @@ python3 scripts/photo_lab.py xmp-crop "$S" --from-plan "<crop.json>"      # → 
 把四角空白挖掉，**比例保持不变**。返回值里的 `rotation.kept_fraction`
 说明旋转吃掉了多少像素（1.5° 约 0.966，2.5° 约 0.945），低于 0.9 要提醒用户。
 
+**出片后先读 `warnings`，再决定要不要看图**（v1.6.4）：`finish` 现在会自己报告
+三件以前要肉眼比对才知道的事——
+`no_crop: true`（整帧输出，取景没动，按 v1.5.0 规则这是 bug，要重做）、
+`crop_adjustment`（裁剪框越界，已在**不改比例**的前提下平移或等比缩小，
+并给出 `requested_box` / `applied_box`）、
+以及 `warnings` 数组里对应的自然语言说明。
+`--crop` 越界到完全在图外则直接报错，不再「平移进画面」给你一块不相干的区域。
+
+**`--crop` 支持负坐标**（v1.6.4）：`--crop "-50,100,600,400"` 现在可以直接写，
+不必再写成 `--crop="-50,..."`。负偏移会被平移回画面内并计入 `crop_adjustment`。
+
 ### 5. 复核 + 交付（含清理）
 
 **只做一次拼图复核**：用 `compare` 生成「原图 | 成品」并排图，`ViewImage` 看一次，
@@ -518,7 +554,7 @@ python3 "$P" panels      "<图>"                     # ★一张多面板图+源
 python3 "$P" panels      "<图>" --regions "EDGE:0,0,600,900;TOWER:200,300,500,700"
 python3 "$P" candidates "<图>" --ratios "4:3" --anchors "center,bottom" --zoom 0.88
 python3 "$P" candidates "<图>" --crops-src "0,176,1068,1424;0,448,1068,1424" --annotate
-python3 "$P" candidates "<图>" --ratios 4:3 --zoom 0.9 --rotate -1.2   # 带旋转的候选
+python3 "$P" candidates "<图>" --ratios 4:3 --zoom 0.9 --rotate -1.2   # 带旋转的候选（v1.6.4 起可用）
 python3 "$P" candidates "<图>" --crops "A:0,0,1500,2000" --keep-crops  # 需要逐张看才落盘
 python3 "$P" crop-plan   "<图>" --ratio 4:5 --anchor center          # 默认写临时目录
 python3 "$P" crop-plan   "<图>" --crop "0,252,3024,3780"             # 精确框
@@ -593,9 +629,12 @@ $TMPDIR/pme_finish_*（finish 的私有解码临时目录，正常会自动删�
     |角度| <0.3° 当 0°；建筑场景量竖边、自然场景量长直线，
     **近景横线（栏杆 / 路缘 / 江岸）是透视线，不能判滚转**。
     把旋转当风格化手段必须由用户明确要求，
-    并说明会先被看到「照片歪了」。旋转不得改变比例——`rotate_fit()` 已按原图
-    约分后的比例量化（8064×6048 → 4:3 → 输出必为 4 和 3 的整数倍），
-    `kept_fraction` < 0.9 要提醒。
+    并说明会先被看到「照片歪了」。旋转不得改变比例——`rotate_fit()` 按
+    **`nominal_ratio`（吸附到 4:3 / 3:2 这类标准比例）**量化，v1.6.4 起不再用
+    `Fraction(w, h)`：800×533 互质，一个比例单位就有 800px 宽，量化会退回整帧，
+    成品带着四个黑楔却报 `kept_fraction: 1.0`。`kept_fraction` < 0.9 要提醒。
+    出片后必须确认四个角没有纯黑楔（成品上有 `rotation.ratio_preserved`
+    与 `output_size`，两者对不上就是量化出错了）。
 13. **长期默认规则不得自行改回**：不得再以「不裁」为理由交付零处理的图。
     诊断与候选照给，然后直接出片，不停下来等拍板。
 14. **测量不手搓**（v1.6.0）：结构线、内容边界、可裁预算、滚转角一律用
@@ -608,6 +647,15 @@ $TMPDIR/pme_finish_*（finish 的私有解码临时目录，正常会自动删�
     每多看一次都是永久 vision token + 一个往返。
 16. **规则回写集中到任务末尾**：`composition-rules.md`、记忆文件、
     版本号一律在收官阶段一次性写完，中途不穿插写文件。
+17. **`finish` 出片后先读机器字段，再决定要不要看图**（v1.6.4）：
+    `warnings` 非空、`no_crop: true`、或 `crop_adjustment.clamped` 为真，
+    都说明「你以为出的图和实际出的图不一样」。`no_crop` = 取景没动 = 重做；
+    `crop_adjustment` 只能解释、不能当作没问题。**不要靠肉眼 diff 才发现这些。**
+18. **`scenarios: []` 不是判决**（v1.6.4）：`survey` 的采样器只在内容框之外的
+    空白边距里找切点，内容占满整帧时它一个方案都提不出（实测 IMG_0864
+    实际裁掉 20%，方案表为空）。空表时读 `verdict` 判断属于哪一类，
+    再用 `structure_lines` + `clean_cuts` + `budget` 手工定切点；
+    **绝不能因为表空了就说「这张不用裁」。**
 
 ## 能力边界
 

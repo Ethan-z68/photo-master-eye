@@ -35,6 +35,16 @@ needs macOS ImageIO, and the probe no longer sends small non-RAW images (an
 800x533 JPEG failed the `h >= 600` thumbnail guard) down the sips branch.
 `PME_NO_SIPS=1` forces the Pillow path so the Windows behaviour can be tested
 on a Mac.
+v1.6.4: correctness pass over a reported defect list. Four of them changed the
+DELIVERABLE while the JSON looked healthy, which is the worst class of bug here:
+`--rotate` returned the full frame with blank corners on coprime aspect ratios
+(800x533) and still reported kept_fraction 1.0; an out-of-frame `--crop` was
+per-edge clamped, silently changing the ratio; `candidates --ratios 1:1` emitted
+a `crop_source` snapped to the SOURCE ratio, so `finish --crop` produced a 3:2
+frame; and RGBA input crashed on JPEG encode. Also: `--crop` accepts negative
+coordinates without `=`, ratio parsing and region parsing fail with readable
+messages instead of raw ValueError, and `finish` reports `no_crop` / `warnings`
+/ `crop_adjustment` so the caller never has to eyeball a diff.
 """
 from __future__ import annotations
 
@@ -111,17 +121,57 @@ def die(msg: str) -> None:
 
 
 def parse_ratio(text: str) -> float:
+    """Parse '4:3', '3:2', '1.5' ... Fail with a readable message, not a traceback.
+
+    v1.6.4: `--ratio 4:0` used to surface as `ZeroDivisionError: float division
+    by zero` and `--ratio abc` as `ValueError: could not convert string to
+    float`. Both are the tool's fault, not the caller's: the CLI contract is
+    "ratios look like A:B or a decimal", so say that.
+    """
+    raw = text
     text = text.strip()
     if text in RATIO_MAP:
         return RATIO_MAP[text]
-    if ":" in text:
-        a, b = text.split(":", 1)
-        return float(a) / float(b)
-    return float(text)
+    try:
+        if ":" in text:
+            a, b = text.split(":", 1)
+            val = float(a) / float(b)
+        else:
+            val = float(text)
+    except ZeroDivisionError:
+        die(f"--ratio cannot divide by zero: {raw!r}. Use a form like 4:5, 3:2 "
+            f"or 1.5")
+    except ValueError:
+        die(f"--ratio must look like 4:5, 3:2 or 1.5 (got {raw!r})")
+    if not (val > 0) or not math.isfinite(val):
+        die(f"--ratio must be a positive finite number (got {raw!r} -> {val})")
+    return val
 
 
 def ratio_tag(text: str) -> str:
     return text.replace(":", "x").replace(".", "p")
+
+
+def ratio_fraction(text: str) -> Fraction:
+    """Turn a --ratios token into the exact Fraction it denotes.
+
+    v1.6.4: `candidates --ratios 4:3` reported a `crop_source` snapped to the
+    SOURCE image ratio (3:2 here), because snap_box() was always fed
+    nominal_ratio(source). Pasting that into `finish --crop` silently delivered
+    a different framing than the candidate the user picked -- for 1:1 the
+    "square" candidate came back 957x638. Each candidate now snaps to ITS OWN
+    ratio instead.
+    """
+    text = text.strip()
+    if ":" in text:
+        a, b = text.split(":", 1)
+        try:
+            num, den = int(a), int(b)
+            if num > 0 and den > 0:
+                return Fraction(num, den)
+        except ValueError:
+            pass
+    return Fraction(parse_ratio(text)).limit_denominator(100)
 
 
 def open_photo(path: Path):
@@ -154,7 +204,14 @@ def to_rgb(img: Image.Image) -> Image.Image:
 
 
 def save_photo(img: Image.Image, out: Path, quality: int, exif_bytes: bytes) -> str:
-    """Save to a NEW file. Returns a note about the JPEG encoding path used."""
+    """Save to a NEW file. Returns a note about the JPEG encoding path used.
+
+    v1.6.4: the mode is normalized for JPEG here, not at every call site. A PNG
+    with alpha (RGBA/LA/P) reaching `img.save(..., "JPEG")` raised
+    `OSError: cannot write mode RGBA as JPEG` -- which never showed up on macOS
+    because `sips` always decodes to RGB, and appeared the moment you passed
+    `--decode-format png` or used `develop` on a transparent PNG.
+    """
     out.parent.mkdir(parents=True, exist_ok=True)
     ext = out.suffix.lower()
     if ext in (".png", ".tif", ".tiff"):
@@ -163,6 +220,8 @@ def save_photo(img: Image.Image, out: Path, quality: int, exif_bytes: bytes) -> 
     if ext == ".webp":
         img.save(out, "WEBP", quality=quality, exif=exif_bytes)
         return "webp"
+    # Everything below is JPEG: flatten alpha onto white first.
+    img = to_rgb(img)
     # Pillow/libjpeg raises "Suspension not allowed here / broken data stream"
     # on large images when optimize=True is combined with subsampling=0 (4:4:4).
     # Skip that path for big images (also avoids noise on stderr); keep the
@@ -330,18 +389,42 @@ def rotate_fit(img: Image.Image, angle_deg: float):
     if not angle_deg:
         return img, (0, 0, img.width, img.height), 1.0
     w, h = img.size
-    ratio = w / h
-    # Quantise to the source's exact ratio as a fraction (8064x6048 -> 4:3), so
-    # the result is a multiple of 4x3 and the ratio is bit-exact instead of
-    # drifting by ~0.03% from independent flooring of both dimensions.
-    frac = Fraction(w, h)
+    # v1.6.4: quantise to the NOMINAL ratio, not `Fraction(w, h)`.
+    #
+    # `Fraction(800, 533)` is 800:533 -- the numbers are coprime, so one "ratio
+    # unit" is 800px wide, i.e. WIDER than the entire safe box (760px). The old
+    # `k = max(1, floor(nw / 800) - 1)` then went to -1 and `max(1, ...)` pinned
+    # it back to 1, producing an 800x533 output -- larger than the inscribed
+    # rectangle, so all four blank wedges stayed in the picture while the JSON
+    # still claimed kept_fraction 1.0. Ratio-PRIME sizes (3:2, 4:3) hid the bug.
+    #
+    # `nominal_ratio` already existed for exactly this (see snap_box); using it
+    # also keeps the output aspect bit-exact instead of drifting.
+    frac = nominal_ratio(w, h)
+    num, den = frac.numerator, frac.denominator
+    ratio = num / den
     th = math.radians(abs(angle_deg))
     c, s = math.cos(th), math.sin(th)
     # Bounding-box condition: an axis-aligned (nw, nh) rect fits inside the
     # rotated original iff nw*cos + nh*sin <= w and nw*sin + nh*cos <= h.
-    nw = min(w / (c + s / ratio), h / (s + c / ratio))
-    k = max(1, math.floor(nw / frac.numerator) - 1)
-    nw, nh = k * frac.numerator, k * frac.denominator
+    nw_max = min(w / (c + s / ratio), h / (s + c / ratio))
+    k = int(nw_max // num)
+    if k >= 1:
+        nw, nh = k * num, k * den
+    else:
+        # The ratio unit alone is bigger than the safe box (tiny frames at large
+        # angles). Fall back to per-pixel rounding rather than silently keeping
+        # the full frame.
+        nw = max(1, int(nw_max))
+        nh = max(1, int(round(nw / ratio)))
+    # Hard clamp instead of the old "-1 unit" fudge: -1 shrank the box by a
+    # whole ratio unit (e.g. 4px on a 4:3), which was both imprecise and, once
+    # `max(1, ...)` was applied, capable of returning the unsafe full frame.
+    while nw * c + nh * s > w or nw * s + nh * c > h:
+        nw -= 1
+        nh = max(1, int(round(nw / ratio)))
+        if nw < 16:
+            break
     if nw < 16 or nh < 16:
         die(f"rotation {angle_deg} deg leaves {nw}x{nh}px - too small")
     rot = img.rotate(-angle_deg, resample=Image.BICUBIC, expand=True)
@@ -367,9 +450,13 @@ def parse_explicit_crops(text: str):
             label = label.strip() or chr(65 + len(out))
         else:
             label, coords = chr(65 + len(out)), part
-        vals = [int(float(v)) for v in coords.split(",")]
+        try:
+            vals = [int(float(v)) for v in coords.split(",")]
+        except ValueError:
+            die(f"cannot read coordinates in {part!r}: expected 'label:x,y,w,h' "
+                f"or 'x,y,w,h' with integer pixels")
         if len(vals) != 4 or vals[2] <= 0 or vals[3] <= 0:
-            die(f"invalid crop in --crops: {part!r} (need x,y,w,h with w,h>0)")
+            die(f"invalid crop in {part!r} (need x,y,w,h with w,h>0)")
         x, y, cw, ch = vals
         out.append((label, (x, y, x + cw, y + ch)))
     if not out:
@@ -394,10 +481,18 @@ def cmd_candidates(args) -> None:
                                int(meta["source_size"][1]))
     rotate_info = None
     if getattr(args, "rotate", 0.0):
-        base, _, rfactor = rotate_fit(base, args.rotate)
+        # v1.6.4: the base is NOT pre-rotated any more. Rotating it here put
+        # every candidate box on a padded, shifted canvas, so `crop_source` and
+        # `finish` had to be suppressed -- the documented
+        # `candidates --ratios 4:3 --zoom 0.9 --rotate -1.2` combo produced a
+        # dead end. Each candidate is rotated for DISPLAY only, which is exactly
+        # what `finish` does per box (crop -> rotate -> trim), so the box below
+        # stays valid decode-space coordinates.
         rotate_info = {"angle_deg": args.rotate,
-                       "kept_fraction": round(rfactor, 4),
-                       "ratio_preserved": True}
+                       "applied_to": "each candidate, after its crop (display "
+                                     "and finish agree)",
+                       "note": "crop coordinates stay in DECODE space; pass the "
+                               "same --rotate to finish"}
     w, h = base.size
     out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else \
         work_dir_for(src) / "candidates"
@@ -412,29 +507,52 @@ def cmd_candidates(args) -> None:
     # and ~5k permanent vision tokens; one legible sheet costs one.
     cell_w, cell_h, bar = (440, 380, 64) if annotate else (360, 300, 30)
 
-    def add_candidate(tag: str, box, extra: dict) -> None:
+    def add_candidate(tag: str, box, extra: dict, snap_frac=None) -> None:
         """Crop + thumbnail in memory; write a JPEG only on --keep-crops.
 
         Policy (v1.4.0) keeps only the original and the final deliverable, so
         writing N candidate files just to delete them later is wasted I/O.
         """
-        crop_img = base.crop(box)
-        rec = {"id": tag[:2], "label": tag, "crop": list(box),
-               "size": [box[2] - box[0], box[3] - box[1]],
-               "thumb": ImageOps.contain(crop_img, (cell_w - 12, cell_h - 12)),
-               **extra}
-        # Source-pixel box, snapped to the exact source ratio. `finish --crop`
+        # Source-pixel box, snapped to THIS candidate's ratio. `finish --crop`
         # consumes this verbatim; no map-crop step needed.
-        if rotate_info is None:
-            rec["crop_source"] = snap_box(
-                work_to_source(meta, (box[0], box[1],
-                                      box[2] - box[0], box[3] - box[1])),
-                ratio_frac)
-            rec["finish"] = ('--crop "%d,%d,%d,%d"'
-                             % tuple(rec["crop_source"]))
+        src_box = snap_box(
+            work_to_source(meta, (box[0], box[1],
+                                  box[2] - box[0], box[3] - box[1])),
+            snap_frac or ratio_frac)
+        # Display from the SNAPPED box, not from `box`. snap_box quantises to the
+        # ratio unit (4px on a 4:3), so the unsnapped crop is a slightly
+        # different frame than `finish` renders -- 3px on a test facade, but the
+        # entire value of this command is "what you see is what you deliver".
+        sx, sy = meta["scale_x"], meta["scale_y"]
+        disp = (int(round(src_box[0] * sx)), int(round(src_box[1] * sy)),
+                int(round((src_box[0] + src_box[2]) * sx)),
+                int(round((src_box[1] + src_box[3]) * sy)))
+        disp = (max(0, disp[0]), max(0, disp[1]),
+                min(base.width, max(disp[0] + 1, disp[2])),
+                min(base.height, max(disp[1] + 1, disp[3])))
+        crop_img = base.crop(disp)
+        shown, kept = crop_img, 1.0
+        if rotate_info is not None:
+            shown, _, kept = rotate_fit(crop_img, rotate_info["angle_deg"])
+        rec = {"id": tag[:2], "label": tag, "crop": list(box),
+               "size": [src_box[2], src_box[3]],
+               "thumb": ImageOps.contain(shown, (cell_w - 12, cell_h - 12)),
+               **extra}
+        if rotate_info is not None:
+            rec["rotation"] = {"angle_deg": rotate_info["angle_deg"],
+                               "kept_fraction": round(kept, 4),
+                               "final_size": list(shown.size)}
+        rec["crop_source"] = src_box
+        rec["finish"] = ('--crop "%d,%d,%d,%d"'
+                         % tuple(rec["crop_source"]))
+        if rotate_info is not None:
+            rec["finish"] += " --rotate %g" % rotate_info["angle_deg"]
+            rec["finish_note"] = ("crop is applied to the UNROTATED decode, then "
+                                 "rotated and trimmed -- same order as the "
+                                 "thumbnail, so the frame matches")
         if args.keep_crops:
             fp = out_dir / f"cand_{tag}.jpg"
-            crop_img.save(fp, "JPEG", quality=args.quality, subsampling=0)
+            shown.save(fp, "JPEG", quality=args.quality, subsampling=0)
             rec["file"] = str(fp)
         items.append(rec)
 
@@ -458,7 +576,9 @@ def cmd_candidates(args) -> None:
             add_candidate(f"{idx:02d}_{label}", box,
                           {"ratio": round((box[2] - box[0]) / (box[3] - box[1]), 4),
                            "anchor": "explicit",
-                           "clipped": list(box) != list(raw_box)})
+                           "clipped": list(box) != list(raw_box)},
+                          snap_frac=nominal_ratio(box[2] - box[0],
+                                                  box[3] - box[1]))
     else:
         mode = "geometric"
         ratios = [r.strip() for r in args.ratios.split(",") if r.strip()]
@@ -484,7 +604,7 @@ def cmd_candidates(args) -> None:
                                      "identical to an earlier one. Use --zoom < 1 "
                                      "or --crops with explicit boxes.")
                     duplicates.append(tag)
-                add_candidate(tag, box, extra)
+                add_candidate(tag, box, extra, snap_frac=ratio_fraction(rtext))
 
     # contact sheet: built from in-memory thumbnails, no re-reads from disk
     cols = min(3, len(items)) or 1
@@ -611,13 +731,96 @@ def grade(img: Image.Image, p: dict) -> Image.Image:
 
 
 def parse_crop(text: str):
-    parts = [int(float(v)) for v in text.split(",")]
+    try:
+        parts = [int(float(v)) for v in text.split(",")]
+    except ValueError:
+        die(f"--crop must be 'x,y,w,h' in pixels (got {text!r})")
     if len(parts) != 4:
-        die("--crop must be 'x,y,w,h'")
+        die(f"--crop must be 'x,y,w,h' (got {len(parts)} values in {text!r})")
     x, y, cw, ch = parts
     if cw <= 0 or ch <= 0:
         die("crop width/height must be positive")
     return (x, y, x + cw, y + ch)
+
+
+def fit_box_to_frame(box, w: int, h: int, what: str = "crop"):
+    """Bring a crop box inside the frame WITHOUT changing its aspect ratio.
+
+    v1.6.4. The old code clamped each edge independently:
+
+        box = (max(0, x0), max(0, y0), min(w, x1), min(h, y1))
+
+    On a 1080x720 frame, `--crop 900,0,600,400` (a 3:2 request) became
+    (900,0,1080,400) = 180x400 = 1:2.2, the command exited 0 and the JSON
+    looked healthy. For a tool whose whole promise is "the ratio never
+    changes", that is the worst possible failure: silent and plausible.
+
+    Correct order is translate first (free, ratio-exact), and only shrink if
+    the box is genuinely larger than the frame -- and then shrink BOTH axes by
+    the same factor. `parse_crop` keeps the caller's intent; this function only
+    reports what was adjusted.
+
+    Returns (box, adjustment) where adjustment is None when nothing moved.
+    """
+    raw = [int(round(v)) for v in box]
+    x0, y0, x1, y1 = raw
+    bw, bh = x1 - x0, y1 - y0
+    if bw <= 0 or bh <= 0:
+        die(f"invalid {what} size {bw}x{bh}: width and height must be > 0")
+    req = bw / bh
+    notes = []
+
+    # 0) a box that misses the frame entirely is a mistake, not a nudge. Without
+    # this, "5000,5000,600,400" was translated to a perfectly valid but totally
+    # unrelated corner of the picture and reported as success.
+    if x1 <= 0 or y1 <= 0 or x0 >= w or y0 >= h:
+        die(f"{what} {raw} lies entirely outside the {w}x{h} frame "
+            f"(x 0..{w}, y 0..{h}). Check the coordinate space: `--crop` takes "
+            f"DISPLAY-oriented pixels, and a SOURCE-space box from `survey` "
+            f"must be scaled first.")
+
+    # 1) shrink uniformly only if the request is physically too big
+    if bw > w or bh > h:
+        if bw / bh >= w / h:          # width is the binding axis
+            nw = int(w)
+            nh = max(1, int(round(nw / req)))
+            if nh > h:                # rounding pushed it over
+                nh = int(h)
+                nw = max(1, int(round(nh * req)))
+        else:                          # height is the binding axis
+            nh = int(h)
+            nw = max(1, int(round(nh * req)))
+            if nw > w:
+                nw = int(w)
+                nh = max(1, int(round(nw / req)))
+        notes.append(f"requested {bw}x{bh} is larger than the {w}x{h} frame; "
+                     f"scaled uniformly to {nw}x{nh} so the ratio survives")
+        bw, bh = nw, nh
+
+    # 2) translate inside -- no edge is cut, so the ratio is untouched
+    nx0 = min(max(0, x0), w - bw)
+    ny0 = min(max(0, y0), h - bh)
+    if (nx0, ny0) != (x0, y0):
+        notes.append(f"shifted from ({x0},{y0}) to ({nx0},{ny0}) to stay inside "
+                     f"the frame")
+    out = (int(nx0), int(ny0), int(nx0 + bw), int(ny0 + bh))
+
+    # 3) hard invariant: the applied box must have the requested aspect
+    drift = abs((bw / bh) / req - 1.0)
+    if drift > 0.005:
+        die(f"{what} {raw} became {list(out)} (aspect {bw / bh:.4f}) after "
+            f"fitting the {w}x{h} frame, drifting {drift * 100:.2f}% from the "
+            f"requested {req:.4f}. Pass a box that fits, or a smaller size.")
+
+    if not notes:
+        return out, None
+    return out, {
+        "requested_box": raw,
+        "applied_box": list(out),
+        "clamped": True,
+        "ratio_drift_pct": round(drift * 100, 3),
+        "notes": notes,
+    }
 
 
 def cmd_develop(args) -> None:
@@ -631,9 +834,7 @@ def cmd_develop(args) -> None:
         box = crop_box(w, h, parse_ratio(args.ratio), args.anchor)
     else:
         box = (0, 0, w, h)
-    box = (max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3]))
-    if box[2] <= box[0] or box[3] <= box[1]:
-        die(f"invalid crop box {box} for image {w}x{h}")
+    box, crop_adjust = fit_box_to_frame(box, w, h, "crop")
     img = img.crop(box)
 
     # v1.2.0: color grading removed from the default workflow. Pixel edits are
@@ -666,13 +867,15 @@ def cmd_develop(args) -> None:
 
     sidecar = out.parent / f"{out.stem}.json"
     record = {"source": str(src), "output": str(out), "source_size": [w, h],
-              "crop_box": list(box), "output_size": list(img.size),
+              "crop_box": list(box), "crop_adjustment": crop_adjust,
+              "output_size": list(img.size),
               "color_grading": grading,
               "preset": args.preset if args.grade else "none", "params": p,
               "quality": args.quality, "encoding": encoding,
               "warning": warning, "pillow": PILLOW_VERSION}
     sidecar.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     emit({"output": str(out), "sidecar": str(sidecar), "crop_box": list(box),
+          "crop_adjustment": crop_adjust, "output_size": list(img.size),
           "color_grading": grading, "params": p, "encoding": encoding,
           "warning": warning,
           "note": "Source untouched. Prefer crop-plan + xmp-crop for "
@@ -1097,30 +1300,49 @@ def cmd_finish(args) -> None:
             box = crop_box(w, h, ratio, args.anchor, getattr(args, "zoom", 1.0))
         else:
             box = (0, 0, w, h)
-        box = (max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3]))
-        if box[2] <= box[0] or box[3] <= box[1]:
-            die(f"invalid crop box {box} for decoded {w}x{h}")
+        box, crop_adjust = fit_box_to_frame(box, w, h, "crop")
         if box != (0, 0, w, h):
             img = img.crop(box)
+        # v1.6.4: say it out loud when nothing was framed away. SKILL.md treats
+        # "output is pixel-identical to the source" as a failure of the framing
+        # step, and until now the caller had to diff images to notice.
+        no_crop = box == (0, 0, w, h) and not getattr(args, "rotate", 0.0)
         # Rotation comes AFTER the crop on purpose: --crop coordinates stay in
         # decode/preview space (no remapping), and rotate_fit() then trims back
         # to the largest inscribed rectangle, so the crop ratio survives intact.
         rotation = None
         if getattr(args, "rotate", 0.0):
+            pre = img.size
             img, rbox, rfactor = rotate_fit(img, args.rotate)
+            drift = abs((img.width / img.height) / (pre[0] / pre[1]) - 1.0)
             rotation = {"angle_deg": args.rotate, "clockwise": True,
                         "kept_fraction": round(rfactor, 4),
-                        "ratio_preserved": True,
+                        "cropped_size_before_trim": list(pre),
+                        "output_size": list(img.size),
+                        "ratio_preserved": drift <= 0.004,
+                        "ratio_drift_pct": round(drift * 100, 3),
                         "order": "crop, then rotate, then trim to inscribed rect",
-                        "note": "blank corners removed; the cropped ratio is kept"}
+                        "note": "blank corners removed; the cropped ratio is kept "
+                                "to the nearest standard ratio"}
         encoding = save_photo(img, out, args.quality, b"")
         decode_mb = tmp.stat().st_size / 1024 / 1024
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     elapsed = time.perf_counter() - t0
+    warnings = []
+    if crop_adjust:
+        warnings.append("the crop box did not fit the decoded frame and was "
+                        "repositioned/rescaled; see crop_adjustment. The aspect "
+                        "ratio is unchanged.")
+    if no_crop:
+        warnings.append("no_crop: the output is the whole decoded frame, so the "
+                        "framing did not change. Use --zoom < 1, --crop or "
+                        "--ratio with a different ratio if that was not intended.")
     record = {"source": str(src), "output": str(out),
               "output_size": list(img.size), "crop_box": list(box),
+              "crop_adjustment": crop_adjust, "no_crop": no_crop,
+              "warnings": warnings,
               "decoded_size": [w0, h0], "orientation": orient,
               "raw_stored_size": stored, "probe": probe,
               "rotation": rotation,
@@ -1179,12 +1401,14 @@ def _resolve_crop(src: Path, args):
         box = crop_box(ow, oh, parse_ratio(args.ratio), args.anchor)
     else:
         box = (0, 0, ow, oh)
-    box = (max(0, box[0]), max(0, box[1]), min(ow, box[2]), min(oh, box[3]))
-    if box[2] <= box[0] or box[3] <= box[1]:
-        die(f"invalid crop box {box} for {ow}x{oh}")
+    box, crop_adjust = fit_box_to_frame(box, ow, oh, "crop")
     meta = {"orientation": orient, "raw_stored_size": stored, "probe": probe,
             "coordinate_system": ("display-oriented (EXIF applied)"
                                   if orient in (5, 6, 7, 8) else "stored")}
+    if crop_adjust:
+        # crop-plan / xmp-crop must never hand Camera Raw a box whose ratio
+        # silently differs from what the caller asked for.
+        meta["crop_adjustment"] = crop_adjust
     return (ow, oh), box, meta
 
 
@@ -1777,6 +2001,51 @@ def cmd_survey(args) -> None:
             cl, ct, cr, cb, meta, Path(args.out_dir).expanduser().resolve()
             if args.out_dir else work_dir_for(src)))
 
+    # `_cut_scenarios` only proposes cuts that keep the CONTENT box intact, and
+    # it only samples cut positions inside the dead margins. A street scene with
+    # texture from edge to edge has no margins at all, so the sampler legitimately
+    # finds nothing -- even though a photographer would crop 20% off the dark
+    # foreground. Say that explicitly instead of implying "nothing to do".
+    edge_to_edge = (cl <= 2 and ct <= 2 and cr >= w - 2 and cb >= h - 2)
+    # A synthetic flat frame also has an edge-to-edge content box, so it has to be
+    # separated out: 0.0 luma units of detail is "no image", not "no margin".
+    flat = max(float(row_detail.max()), float(col_detail.max())) < 0.5
+
+    if scen_out:
+        verdict = (f"{len(scen_out)} framing option(s); deliberately unranked")
+        next_step = ("pick a scenario id, look at them together with "
+                     "`candidates <image> --crops-src \"label:x,y,w,h;...\" "
+                     "--annotate`, then render the chosen one with "
+                     "`finish --crop ...`.")
+    elif flat:
+        verdict = ("no structure at all: maximum row/column edge energy is under "
+                   "0.5 luma units, i.e. a flat or synthetic image. There is no "
+                   "cut to anchor anything to.")
+        next_step = ("deliver the file unchanged and say the framing did not "
+                     "change. Do not invent a crop.")
+    elif edge_to_edge:
+        verdict = ("content fills the frame edge to edge, so no cut can keep the "
+                   "content box intact. The sampler only searches the dead "
+                   "margins, and there are none -- this is a limitation of the "
+                   "sampler, NOT a statement that the frame is finished.")
+        next_step = ("decide by hand from `structure_lines`, `clean_cuts` and "
+                     "`budget`: pick cut positions where edge energy is low "
+                     "(`clean_cuts`), write the boxes into "
+                     "`candidates <image> --crops-src \"label:x,y,w,h;...\" "
+                     "--annotate`, then `finish --crop ...`.")
+    else:
+        verdict = ("no framing option survived the sampler: the content box "
+                   "leaves margins, but no ratio-preserving cut sampled from them "
+                   f"removes more than {args.min_removed:.0%} of the area. That is "
+                   "a statement about the sampler, NOT about your photograph -- "
+                   "a frame can be far from tight and still have no cut that "
+                   "keeps every bit of content.")
+        next_step = ("read `structure_lines`, `clean_cuts` and `budget` and decide "
+                     "by hand if you disagree with the sampler; then write boxes "
+                     "into `candidates <image> --crops-src \"label:x,y,w,h;...\" "
+                     "--annotate` and render with `finish --crop ...`. If the cut "
+                     "you want does destroy content, say which content and why.")
+
     emit({"artifacts": artifacts,
           "source": str(src), "source_size": meta["source_size"],
           "analysis_size": meta["work_size"], "scale": round(meta["scale_x"], 4),
@@ -1789,6 +2058,7 @@ def cmd_survey(args) -> None:
           "budget": budget,
           "clean_cuts": clean,
           "scenarios": scen_out,
+          "verdict": verdict,
           "how_to_read": "Scenarios are NOT ranked: there is no total score, "
                          "because a number would make 'which framing is better' "
                          "look computable. Read `removed_px` (what each edge "
@@ -1796,9 +2066,7 @@ def cmd_survey(args) -> None:
                          "destroyed) and `edge_penalty` (how much structure the "
                          "cut crosses, lower is cleaner), then choose by what "
                          "you are willing to sacrifice.",
-          "next": "pick a scenario id, look at them together with "
-                  "`candidates <image> --crops-src \"label:x,y,w,h;...\" --annotate`, "
-                  "then render the chosen one with `finish --crop ...`.",
+          "next": next_step,
           "note": "All crop values are DISPLAY-oriented SOURCE pixels and already "
                   "snapped to an exact integer ratio."})
 
@@ -2137,16 +2405,18 @@ def cmd_panels(args) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.regions:
+        # v1.6.4: same grammar as --crops-src (label optional, validated once).
+        # The old loop split on ':' unconditionally, so `--regions "0,0,800,400"`
+        # died with `ValueError: not enough values to unpack (expected 2, got 1)`
+        # -- and a region outside the frame was silently cropped into a black
+        # pane instead of being reported.
         regions = []
-        for part in args.regions.split(";"):
-            part = part.strip()
-            if not part:
-                continue
-            label, coords = part.split(":", 1)
-            x, y, rw, rh = [float(v) for v in coords.split(",")]
-            regions.append((label.strip(),
-                            int(x / meta["scale_x"]), int(y / meta["scale_y"]),
-                            int(rw / meta["scale_x"]), int(rh / meta["scale_y"])))
+        for label, box in parse_explicit_crops(args.regions):
+            x0 = int(round(box[0] / meta["scale_x"]))
+            y0 = int(round(box[1] / meta["scale_y"]))
+            x1 = int(round(box[2] / meta["scale_x"]))
+            y1 = int(round(box[3] / meta["scale_y"]))
+            regions.append((label, x0, y0, x1 - x0, y1 - y0))
     else:
         regions = [("TOP", 0, 0, w, int(h * 0.22)),
                    ("BOTTOM", 0, int(h * 0.78), w, int(h * 0.22)),
@@ -2155,10 +2425,15 @@ def cmd_panels(args) -> None:
                    ("MIDDLE", int(w * 0.20), int(h * 0.40), int(w * 0.60), int(h * 0.30))]
 
     items = []
+    clipped = []
     for label, x, y, rw, rh in regions:
-        x = max(0, min(x, w - 8)); y = max(0, min(y, h - 8))
-        rw = max(8, min(rw, w - x)); rh = max(8, min(rh, h - y))
-        items.append((label, img.crop((x, y, x + rw, y + rh)), (x, y, rw, rh)))
+        nx = max(0, min(x, w - 8)); ny = max(0, min(y, h - 8))
+        nrw = max(8, min(rw, w - nx)); nrh = max(8, min(rh, h - ny))
+        if (nx, ny, nrw, nrh) != (x, y, rw, rh):
+            clipped.append({"label": label, "requested": [x, y, rw, rh],
+                            "applied": [nx, ny, nrw, nrh]})
+        items.append((label, img.crop((nx, ny, nx + nrw, ny + nrh)),
+                      (nx, ny, nrw, nrh)))
 
     # Variable-height rows. A uniform grid sized to the tallest pane wastes most
     # of the sheet on a 3:4 frame (the tall left/right strips dictate the cell
@@ -2233,14 +2508,38 @@ def cmd_panels(args) -> None:
                                                 int(b[2] * meta["scale_x"]),
                                                 int(b[3] * meta["scale_y"])]}
                       for lb, _, b, _ in blocks],
+          "clipped_regions": clipped,
           "note": "One image instead of N separate looks. Labels are SOURCE px "
                   "so a coordinate read here can go straight into --crop."})
 
 
 
+class CropFriendlyParser(argparse.ArgumentParser):
+    """An ArgumentParser that accepts negative crop coordinates.
+
+    `--crop "-50,100,600,400"` used to die with
+    `error: argument --crop: expected one argument`, because argparse checks
+    `_negative_number_matcher` (a whole-string number test) before deciding a
+    token is a value, and "-50,100,600,400" is not a number. Negative offsets
+    are not hypothetical here: `map-crop` clamps at zero and preview->source
+    scaling routinely overshoots.
+
+    Returning None from `_parse_optional` means "this is an argument, not an
+    option". The pattern only fires for a leading minus followed by a digit AND
+    a comma, so no real option name can be swallowed.
+    """
+
+    _VALUE_WITH_COMMA = re.compile(r"^-\d[^ ]*,")
+
+    def _parse_optional(self, arg_string):
+        if self._VALUE_WITH_COMMA.match(arg_string):
+            return None
+        return super()._parse_optional(arg_string)
+
+
 def build_parser():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = CropFriendlyParser(description=__doc__,
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("info", help="size / format / EXIF")
@@ -2405,7 +2704,8 @@ def build_parser():
     p.add_argument("--crop", help="'x,y,w,h' in original pixels")
     p.add_argument("--ratio")
     p.add_argument("--anchor", default="center", choices=ANCHORS)
-    p.add_argument("--out", help="default: <stem>_crop.json")
+    p.add_argument("--out", help="default: "
+                                 "$TMPDIR/pme_work_<stem>/<stem>_crop.json")
     p.set_defaults(func=cmd_crop_plan)
 
     p = sub.add_parser("xmp-crop", help="write Camera Raw XMP sidecar, source untouched")
