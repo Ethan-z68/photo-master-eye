@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Photo Master Eye process artefacts — never commit deliverables
+*_final.jpg
+*_final.png
+*_final.tiff
+*_final.json
+*_preview.jpg
+*_preview.json
+*_grid.jpg
+*_full.jpg
+*_full.png
+*.xmp
+crop.json
+pme_work_*/
+pme_finish_*/
