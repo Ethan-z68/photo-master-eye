@@ -46,8 +46,10 @@ git clone https://github.com/<you>/photo-master-eye.git \
 
 ```bash
 python3 -m pip install --user pillow numpy
-# macOS 处理 RAW 另需系统自带的 sips（无需安装）
+# RAW 解码依赖 macOS 自带的 sips（无需安装）。非 RAW 格式不需要它。
 ```
+
+**平台支持**：JPEG / PNG / TIFF / HEIC 在 macOS、Windows、Linux 上功能一致（走 Pillow）。**只有 RAW 依赖 macOS `sips`**——Windows 上处理 RAW 会给出明确报错，绕过方式是先导出一张 JPEG/TIFF 再处理。v1.6.2 修复了此前「Windows 上连普通 JPEG 都出不了片」的问题。
 
 `numpy` 只有 `survey` / `level` / `panels` 三个分析命令需要；`finish` / `candidates` 等像素命令只依赖 Pillow。
 
@@ -136,6 +138,7 @@ python3 $P finish "IMG.DNG" --crop "0,448,2688,3584"
 ## 已知限制
 
 - **不做主体识别。** 锚点全部基于"主体大致居中"的几何假设，必须看图筛掉切断主体的方案。
+- **RAW 解码是 macOS 专属。** 底层用系统 `sips`（ImageIO），Windows / Linux 上没有等价物，需要用相机或转换器先导出 JPEG/TIFF。非 RAW 格式不受影响。
 - **竖幅可裁幅度天然小。** 竖幅的同比例内接框等于原框（`dx=dy=0`），能动多少完全由"必须留住的边界"决定，常常上下只能保一个。
 - **`level` 在非建筑场景不可靠。** 地铁通道这类场景检到的"竖边"不是结构线，会给偏小的角度（实测 0.95° vs 真值 2.2°），此时置信度会降到 `medium`，应改用单线连续性追踪兜底。
 - **广角仰拍的梯形变形旋转修不了。** 那是 keystone，旋转只会让另一头更歪。

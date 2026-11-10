@@ -21,9 +21,9 @@ description: >
   (that module was removed; if the user asks for 调色, say so and suggest darktable /
   Lightroom / a dedicated tool).
 metadata:
-  version: "1.6.1"
+  version: "1.6.2"
   license: "MIT"
-  requires: "Python 3.9+, Pillow 10+, numpy (survey/level/panels), macOS sips for RAW"
+  requires: "Python 3.9+, Pillow 10+, numpy (survey/level/panels); macOS `sips` only for RAW"
   network: "none - fully local, no API keys"
 ---
 
@@ -193,6 +193,13 @@ Pillow/numpy 代码**——v1.5.2 之前 47.5% 的工具调用是临时测量脚
 
 RAW 不是「大号 JPG」，而是传感器数据，Pillow 读不了。macOS 自带 `sips`
 （ImageIO）可只读解码 CR2/CR3/NEF/ARW/RAF/RW2/DNG/ORF/PEF 等，无需安装。
+
+> **平台边界（v1.6.2）**：`sips` 是 macOS 独有的。**非 RAW 格式
+> （JPEG / PNG / TIFF / HEIC）在任何系统上都走 Pillow**，Windows / Linux 全功能可用。
+> **只有 RAW 需要 `sips`**，在 Windows 上会给出明确报错而不是崩溃；
+> 绕过办法：先用相机或转换器导出一张 JPEG/TIFF，再对那张图跑本 skill。
+> 排查这类问题时可用 `PME_NO_SIPS=1` 强制走 Pillow 分支，在 Mac 上复现
+> Windows 行为。
 
 ```bash
 P=~/.workbuddy/skills/photo-master-eye/scripts/photo_lab.py

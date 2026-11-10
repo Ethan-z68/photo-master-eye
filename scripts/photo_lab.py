@@ -4,7 +4,8 @@
 Subcommands: info | grid | candidates | develop | compare | presets |
              formats | raw-preview | raw-export | map-crop | crop-plan | xmp-crop
 No network access, no API keys, no writes to the source file.
-Requires Python 3.9+ and Pillow 10+, macOS `sips` for RAW decoding.
+Requires Python 3.9+ and Pillow 10+. macOS `sips` only for RAW decoding -- every
+non-RAW format (JPEG/PNG/TIFF/HEIC) goes through Pillow on any OS.
 
 v1.2.1: EXIF orientation is normalized at export time so preview metadata,
 grid, candidates and crop-plan all share ONE canonical coordinate system.
@@ -28,6 +29,12 @@ v1.5.1: `rotate_fit()` quantises the inscribed rectangle to the source ratio as
 an exact fraction (8064x6048 -> 4:3 -> multiples of 4x3). Without this the two
 dimensions were floored independently and the output ratio drifted ~0.03%
 (5607x4204 instead of 5600x4200).
+v1.6.2: platform fix (reported from Windows). `sips` is probed via `has_sips()`
+instead of assumed: non-RAW formats go through Pillow on EVERY OS, only RAW
+needs macOS ImageIO, and the probe no longer sends small non-RAW images (an
+800x533 JPEG failed the `h >= 600` thumbnail guard) down the sips branch.
+`PME_NO_SIPS=1` forces the Pillow path so the Windows behaviour can be tested
+on a Mac.
 """
 from __future__ import annotations
 
@@ -204,9 +211,21 @@ def cmd_info(args) -> None:
                                          "ExposureTime", "FNumber", "ISOSpeedRatings",
                                          "FocalLength", "Orientation")}
     w, h = raw.size
-    emit({"source": str(src), "width": w, "height": h, "mode": raw.mode,
-          "format": raw.format, "orientation": exif.get(274, 1),
-          "current_ratio": round(w / h, 4), "megapixels": round(w * h / 1e6, 2),
+    orient = int(exif.get(274, 1) or 1)
+    # v1.6.2: report DISPLAY-oriented dims for rotated JPEGs too. `info` used to
+    # print stored axes while every other command (open_photo -> exif_transpose)
+    # works in display space, so an orientation=6 photo appeared as 600x800 here
+    # and behaved as 800x600 everywhere else -- and any crop written from those
+    # numbers had its axes swapped.
+    rotated = orient in (5, 6, 7, 8)
+    dw, dh = (h, w) if rotated else (w, h)
+    emit({"source": str(src), "width": dw, "height": dh, "mode": raw.mode,
+          "format": raw.format, "orientation": orient,
+          "width_height_basis": ("display-oriented (EXIF applied)"
+                                 if rotated else "stored sensor"),
+          "stored_size": [w, h],
+          "current_ratio": round(dw / dh, 4),
+          "megapixels": round(dw * dh / 1e6, 2),
           "exif": named, "pillow": PILLOW_VERSION})
     raw.close()
 
@@ -718,7 +737,28 @@ RAW_EXTS = {".dng", ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".arw", ".srf",
             ".fff", ".iiq", ".mos", ".mrw", ".erf", ".dcr", ".srw", ".axr"}
 
 
+def has_sips() -> bool:
+    """True only when macOS `sips` is actually reachable.
+
+    v1.6.2: every sips call used to be unconditional and unguarded, so on
+    Windows the first `subprocess.run(["sips", ...])` raised FileNotFoundError
+    and `finish` could not export even a plain JPEG (it probes geometry before
+    decoding, and the probe fell through to sips for small images).
+
+    `PME_NO_SIPS=1` forces the Pillow path unconditionally. That is how the
+    Windows branch gets tested on a Mac instead of shipping it blind.
+    """
+    if os.environ.get("PME_NO_SIPS"):
+        return False
+    return shutil.which("sips") is not None
+
+
 def sips_size(path: Path):
+    if not has_sips():
+        die(f"`sips` is not available here, so {path.name} cannot be measured. "
+            "sips is macOS-only. This only affects RAW: pass a JPEG/TIFF/PNG and "
+            "every command works. For RAW on Windows/Linux, export a JPEG "
+            "in-camera (or install darktable-cli) and run the skill on that.")
     r = subprocess.run(["sips", "-g", "pixelWidth", "-g", "pixelHeight", str(path)],
                        capture_output=True, text=True)
     if r.returncode != 0:
@@ -735,7 +775,42 @@ def sips_size(path: Path):
     return int(w.group(1)), int(h.group(1))
 
 
+def _pillow_export(src: Path, out: Path, max_side=None, quality=90,
+                   fmt="jpeg") -> Path:
+    """Pillow stand-in for `sips` on NON-RAW input (Windows / Linux / PME_NO_SIPS).
+
+    EXIF orientation is baked in here, which is what `sips` + the later
+    `normalize_orientation()` pair achieves on macOS: pixels upright, no tag
+    left to leak into a JPEG and rotate it twice.
+    """
+    img, _, _ = open_photo(src)
+    if max_side and max(img.size) > max_side:
+        img = img.copy()
+        img.thumbnail((max_side, max_side), Image.LANCZOS)
+    if fmt == "jpeg":
+        img = to_rgb(img)
+    save_photo(img, out, quality, b"")
+    return out
+
+
 def sips_export(src: Path, out: Path, max_side=None, quality=90, fmt="jpeg") -> Path:
+    if src.suffix.lower() not in RAW_EXTS:
+        # Non-RAW never needs ImageIO. Two reasons to prefer Pillow even on a
+        # Mac where sips exists: it avoids a needless lossy re-encode (sips
+        # would produce a second-generation JPEG before we crop it), and it is
+        # the only path on Windows, so both platforms now run the same code.
+        # sips stays as the fallback for formats stock Pillow cannot open.
+        try:
+            return _pillow_export(src, out, max_side, quality, fmt)
+        except Exception as exc:
+            if not has_sips():
+                die(f"Pillow cannot decode {src.name} ({exc}) and `sips` is not "
+                    "available here. Convert the file to JPEG/PNG/TIFF first.")
+    if not has_sips():
+        die(f"decoding {src.suffix.upper()} needs `sips` (macOS) and it is not "
+            "available here. Options: export a JPEG/TIFF from your RAW "
+            "converter and run the skill on that, install darktable-cli, or "
+            "use macOS for the RAW leg.")
     cmd = ["sips", "-s", "format", fmt]
     if fmt == "jpeg":
         cmd += ["-s", "formatOptions", str(quality)]
@@ -810,7 +885,16 @@ def raw_orientation(path: Path) -> int:
     `sips -g orientation` returns <nil> for DNG even when the file carries one,
     so decode a 64px JPEG into a temp dir and read EXIF from that instead.
     Cheap, and avoids pulling the full-size RAW into memory.
+
+    v1.6.2: without sips there is no 64px trick, so read the tag straight off
+    the file with Pillow and give up (1 = upright) if it cannot be parsed.
     """
+    if not has_sips():
+        try:
+            with Image.open(path) as im:
+                return int(im.getexif().get(274, 1) or 1)
+        except Exception:
+            return 1
     import tempfile
     with tempfile.TemporaryDirectory(prefix="pme_orient_") as td:
         tiny = Path(td) / "o.jpg"
@@ -826,24 +910,45 @@ def raw_orientation(path: Path) -> int:
 
 
 def probe_raw(path: Path):
-    """Cheap RAW geometry probe: read the TIFF header, do not decode pixels.
+    """Cheap geometry probe: read the header, do not decode pixels.
 
     Most DNG files are TIFF containers, so Pillow can return size + orientation
     in ~0.09s where sips needs ~1.1s (it decodes). Some DNGs (certain iPhone
     files) raise UnidentifiedImageError, so fall back to sips there.
 
+    v1.6.2: two bugs fixed here, both reported from Windows.
+
+    1. NON-RAW files never take the sips branch any more. A JPEG's Pillow size
+       IS its real size, so routing it through sips was pure waste -- and fatal
+       on Windows, where `cmd_finish` probes geometry before decoding anything.
+    2. The `w >= 600 and h >= 600` guard now applies only to RAW. It exists to
+       reject a DNG header that only exposes the embedded thumbnail, but as an
+       absolute pixel threshold it also rejected legitimate small photos: an
+       800x533 JPEG has h=533, fell through to sips, and died there.
+
     Returns ((stored_w, stored_h), orientation, source).
     """
+    is_raw = path.suffix.lower() in RAW_EXTS
+    w = h = 0
+    orient = 1
     try:
         with Image.open(path) as im:
             w, h = im.size
             orient = int(im.getexif().get(274, 1) or 1)
-        # Guard against a header that only exposes the embedded thumbnail.
-        if w >= 600 and h >= 600:
-            return (w, h), orient, "tiff-header"
-    except Exception:
-        pass
-    return sips_size(path), raw_orientation(path), "sips"
+    except Exception as exc:
+        if not is_raw:
+            die(f"Pillow cannot open {path.name}: {exc}")
+    if not is_raw:
+        return (w, h), orient, "pillow"
+    # RAW: keep the thumbnail guard, because a small size really can mean
+    # "Pillow only opened the embedded preview", not "the photo is small".
+    if w >= 600 and h >= 600:
+        return (w, h), orient, "tiff-header"
+    if has_sips():
+        return sips_size(path), raw_orientation(path), "sips"
+    die(f"cannot measure {path.name}: Pillow only sees the embedded thumbnail "
+        f"({w}x{h}) and `sips` is unavailable. Export a JPEG from your RAW "
+        f"converter, or run the RAW leg on macOS.")
 
 
 def canonical_raw_size(path: Path):
@@ -917,8 +1022,11 @@ def cmd_raw_export(args) -> None:
         die("refusing to overwrite the source RAW")
     sips_export(src, out, max_side=args.max, quality=args.quality, fmt=args.format)
     if args.keep_orientation:
-        norm = {"stored_size": list(sips_size(out)),
-                "canonical_size": list(sips_size(out)),
+        # `out` is always a decoded image, never RAW, so Pillow can measure it.
+        # Calling sips here made --keep-orientation macOS-only for no reason.
+        with Image.open(out) as _im:
+            _sz = list(_im.size)
+        norm = {"stored_size": _sz, "canonical_size": _sz,
                 "orientation": orient, "changed": False}
     else:
         # Re-encoding a full-size PNG/TIFF is expensive but keeps the whole
